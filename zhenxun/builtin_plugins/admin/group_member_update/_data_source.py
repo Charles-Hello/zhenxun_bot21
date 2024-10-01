@@ -1,26 +1,28 @@
-import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone, timedelta
 
 from nonebot.adapters import Bot
-
-# from nonebot.adapters.discord import Bot as DiscordBot
-# from nonebot.adapters.dodo import Bot as DodoBot
-from nonebot.adapters.dodo.models import MemberInfo
 
 # from nonebot.adapters.kaiheila import Bot as KaiheilaBot
 from nonebot.adapters.onebot.v11 import Bot as v11Bot
 from nonebot.adapters.onebot.v12 import Bot as v12Bot
 
-from zhenxun.configs.config import Config
-from zhenxun.models.group_member_info import GroupInfoUser
-from zhenxun.models.level_user import LevelUser
 from zhenxun.services.log import logger
+from zhenxun.configs.config import Config
+from zhenxun.models.level_user import LevelUser
+from zhenxun.models.group_member_info import GroupInfoUser
+
+# from nonebot.adapters.discord import Bot as DiscordBot
+# from nonebot.adapters.dodo import Bot as DodoBot
 
 
 class MemberUpdateManage:
 
     @classmethod
     async def update(cls, bot: Bot, group_id: str):
+        if not group_id:
+            return logger.warning(
+                f"bot: {bot.self_id}，group_id为空，无法更新群成员信息..."
+            )
         if isinstance(bot, v11Bot):
             await cls.v11(bot, group_id)
         elif isinstance(bot, v12Bot):
@@ -98,26 +100,27 @@ class MemberUpdateManage:
             user_id = str(user_info["user_id"])
             nickname = user_info["card"] or user_info["nickname"]
             role = user_info["role"]
-            if default_auth:
-                if role in ["owner", "admin"] and not await LevelUser.is_group_flag(
-                    user_id, group_id
-                ):
+            if (
+                default_auth
+                and role in ["owner", "admin"]
+                and not await LevelUser.is_group_flag(user_id, group_id)
+            ):
+                if role == "owner":
+                    await LevelUser.set_level(user_id, group_id, default_auth + 1)
+                else:
                     await LevelUser.set_level(user_id, group_id, default_auth)
             if user_id in bot.config.superusers:
                 await LevelUser.set_level(user_id, group_id, 9)
-            join_time = datetime.strptime(
-                time.strftime(
-                    "%Y-%m-%d %H:%M:%S", time.localtime(user_info["join_time"])
-                ),
-                "%Y-%m-%d %H:%M:%S",
-            ).replace(tzinfo=timezone(timedelta(hours=8)))
+            join_time = datetime.fromtimestamp(
+                user_info["join_time"], timezone(timedelta(hours=8))
+            )
             if cnt := db_user_uid.count(user_id):
                 users = [u for u in db_user if u.user_id == user_id]
-                user = users[0]
                 if cnt > 1:
                     for u in users[1:]:
                         delete_list.append(u.id)
                 if nickname != uid2name.get(user_id):
+                    user = users[0]
                     user.user_name = nickname
                     update_list.append(user)
             else:
@@ -146,14 +149,18 @@ class MemberUpdateManage:
         if delete_list:
             await GroupInfoUser.filter(id__in=delete_list).delete()
             logger.debug(f"删除重复数据 Ids: {delete_list}", "更新群组成员信息")
-        if delete_member_list := list(
-            set(exist_member_list).difference(set(db_user_uid))
-        ):
+
+        if delete_member_list := [
+            uid for uid in db_user_uid if uid not in exist_member_list
+        ]:
             await GroupInfoUser.filter(
                 user_id__in=delete_member_list, group_id=group_id
             ).delete()
             logger.info(
-                f"删除已退群用户", "更新群组成员信息", group_id=group_id, platform="qq"
+                f"删除已退群用户 {len(delete_member_list)} 条",
+                "更新群组成员信息",
+                group_id=group_id,
+                platform="qq",
             )
 
     @classmethod
@@ -162,7 +169,8 @@ class MemberUpdateManage:
         pass
         # exist_member_list = []
         # default_auth = Config.get_config("admin_bot_manage", "ADMIN_DEFAULT_AUTH")
-        # group_member_list: list[GetGroupMemberInfoResp] = await bot.get_group_member_list(
+        # group_member_list: list[GetGroupMemberInfoResp] =
+        # await bot.get_group_member_list(
         #     group_id=group_id
         # )
         # for user_info in group_member_list:
@@ -177,7 +185,8 @@ class MemberUpdateManage:
         #     if str(user_id) in bot.config.superusers:
         #         await LevelUser.set_level(str(user_id), group_id, 9)
         #     join_time = datetime.strptime(
-        #         time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(user_info["join_time"])),
+        #         time.strftime("%Y-%m-%d %H:%M:%S",
+        # time.localtime(user_info["join_time"])),
         #         "%Y-%m-%d %H:%M:%S",
         #     )
         #     await GroupInfoUser.update_or_create(
@@ -191,7 +200,8 @@ class MemberUpdateManage:
         #         },
         #     )
         #     exist_member_list.append(str(user_id))
-        #     logger.debug("更新成功", "更新群组成员信息", session=user_id, group_id=group_id)
+        #     logger.debug("更新成功", "更新群组成员信息",
+        # session=user_id, group_id=group_id)
         # if delete_member_list := list(
         #     set(exist_member_list).difference(
         #         set(await GroupInfoUser.get_group_member_id_list(group_id))

@@ -1,11 +1,10 @@
 import random
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Callable, Dict
+from collections.abc import Callable
 
-from fastapi import background
-from PIL.ImageFont import FreeTypeFont
 from pydantic import BaseModel
+from PIL.ImageFont import FreeTypeFont
 
 from ._build_image import BuildImage
 
@@ -25,13 +24,13 @@ class RowStyle(BaseModel):
 
 class ImageTemplate:
 
-    color_list = ["#C2CEFE", "#FFA94C", "#3FE6A0", "#D1D4F5"]
+    color_list = ["#C2CEFE", "#FFA94C", "#3FE6A0", "#D1D4F5"]  # noqa: RUF012
 
     @classmethod
     async def hl_page(
         cls,
         head_text: str,
-        items: Dict[str, str],
+        items: dict[str, str],
         row_space: int = 10,
         padding: int = 30,
     ) -> BuildImage:
@@ -162,9 +161,9 @@ class ImageTemplate:
         column_data = []
         for i in range(len(column_name)):
             c = []
-            for l in data_list:
-                if len(l) > i:
-                    c.append(l[i])
+            for lst in data_list:
+                if len(lst) > i:
+                    c.append(lst[i])
                 else:
                     c.append("")
             column_data.append(c)
@@ -182,15 +181,20 @@ class ImageTemplate:
                     _temp["width"] = w
             build_data_list.append(_temp)
         column_image_list = []
+        column_name_image_list: list[BuildImage] = []
+        for i, data in enumerate(build_data_list):
+            column_name_image = await BuildImage.build_text_image(
+                column_name[i], font, 12, "#C8CCCF"
+            )
+            column_name_image_list.append(column_name_image)
+        max_h = max(c.height for c in column_name_image_list)
         for i, data in enumerate(build_data_list):
             width = data["width"] + padding * 2
             height = (base_h + row_space) * (len(data["data"]) + 1) + padding * 2
             background = BuildImage(width, height, (255, 255, 255))
-            column_name_image = await BuildImage.build_text_image(
-                column_name[i], font, 12, "#C8CCCF"
-            )
+            column_name_image = column_name_image_list[i]
             await background.paste(column_name_image, (0, 20), center_type="width")
-            cur_h = column_name_image.height + row_space + 20
+            cur_h = max_h + row_space + 20
             for item in data["data"]:
                 style = RowStyle(font=font)
                 if text_style:
@@ -198,13 +202,15 @@ class ImageTemplate:
                 if isinstance(item, tuple):
                     """图片"""
                     data, width, height = item
+                    image_ = None
                     if isinstance(data, Path):
                         image_ = BuildImage(width, height, background=data)
                     elif isinstance(data, bytes):
                         image_ = BuildImage(width, height, background=BytesIO(data))
                     elif isinstance(data, BuildImage):
                         image_ = data
-                    await background.paste(image_, (padding, cur_h))
+                    if image_:
+                        await background.paste(image_, (padding, cur_h))
                 else:
                     await background.text(
                         (padding, cur_h),
@@ -273,10 +279,9 @@ class ImageTemplate:
         width = 0
         height = 0
         _, h = BuildImage.get_text_size("A", font)
-        image_list = []
         for s in text.split("\n"):
             s = s.strip() or "A"
             w, _ = BuildImage.get_text_size(s, font)
-            width = width if width > w else w
+            width = max(width, w)
             height += h
         return width, height
