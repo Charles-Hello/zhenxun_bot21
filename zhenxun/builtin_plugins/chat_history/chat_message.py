@@ -1,14 +1,21 @@
 from nonebot import on_message
 from nonebot.plugin import PluginMetadata
 from nonebot_plugin_alconna import UniMsg
-from nonebot_plugin_apscheduler import scheduler
-from nonebot_plugin_session import EventSession
+from nonebot_plugin_uninfo import Uninfo
 
 from zhenxun.configs.config import Config
 from zhenxun.configs.utils import PluginExtraData, RegisterConfig
 from zhenxun.models.chat_history import ChatHistory
+from zhenxun.services.db_context import with_db_timeout
 from zhenxun.services.log import logger
+from zhenxun.services.low_priority_writer import (
+    LowPriorityWriterConfig,
+    append_low_priority_record,
+    register_low_priority_writer,
+)
+from zhenxun.services.message_load import is_overloaded
 from zhenxun.utils.enum import PluginType
+from zhenxun.utils.utils import get_entity_ids
 
 __plugin_meta__ = PluginMetadata(
     name="消息存储",
@@ -28,7 +35,7 @@ __plugin_meta__ = PluginMetadata(
                 type=bool,
             )
         ],
-    ).dict(),
+    ).to_dict(),
 )
 
 
@@ -38,46 +45,53 @@ def rule(message: UniMsg) -> bool:
 
 chat_history = on_message(rule=rule, priority=1, block=False)
 
+_WRITER_NAME = "chat_history"
+_FLUSH_BATCH_SIZE = 200
+_FLUSH_MAX_PER_TICK = 1000
+_FLUSH_DB_TIMEOUT = 5.0
 
-TEMP_LIST = []
 
-
-@chat_history.handle()
-async def _(message: UniMsg, session: EventSession):
-    # group_id = session.id3 or session.id2
-    group_id = session.id2
-    TEMP_LIST.append(
-        ChatHistory(
-            user_id=session.id1,
-            group_id=group_id,
-            text=str(message),
-            plain_text=message.extract_plain_text(),
-            bot_id=session.bot_id,
-            platform=session.platform,
-        )
+async def _write_chat_history_batch(batch: list[ChatHistory], reason: str) -> None:
+    await with_db_timeout(
+        ChatHistory.bulk_create(batch, _FLUSH_BATCH_SIZE),
+        timeout=_FLUSH_DB_TIMEOUT,
+        operation=f"ChatHistory.bulk_create[{len(batch)}]",
+        source=f"chat_history:{reason}",
     )
 
 
-@scheduler.scheduled_job(
-    "interval",
-    minutes=1,
+register_low_priority_writer(
+    LowPriorityWriterConfig(
+        name=_WRITER_NAME,
+        write_batch=_write_chat_history_batch,
+        batch_size=_FLUSH_BATCH_SIZE,
+        trigger_size=_FLUSH_BATCH_SIZE,
+        max_retain=5000,
+        flush_interval_seconds=60.0,
+        max_items_per_cycle=_FLUSH_MAX_PER_TICK,
+        backoff_base_seconds=30.0,
+        backoff_max_seconds=600.0,
+        log_command="chat_history",
+    )
 )
-async def _():
+
+
+@chat_history.handle()
+async def _(message: UniMsg, session: Uninfo):
+    entity = get_entity_ids(session)
+    if is_overloaded():
+        return
     try:
-        message_list = TEMP_LIST.copy()
-        TEMP_LIST.clear()
-        if message_list:
-            await ChatHistory.bulk_create(message_list)
-        logger.debug(f"批量添加聊天记录 {len(message_list)} 条", "定时任务")
+        await append_low_priority_record(
+            _WRITER_NAME,
+            ChatHistory(
+                user_id=entity.user_id,
+                group_id=entity.group_id,
+                text=str(message),
+                plain_text=message.extract_plain_text(),
+                bot_id=session.self_id,
+                platform=session.platform,
+            ),
+        )
     except Exception as e:
-        logger.error(f"定时批量添加聊天记录", "定时任务", e=e)
-
-
-# @test.handle()
-# async def _(event: MessageEvent):
-#     print(await ChatHistory.get_user_msg(event.user_id, "private"))
-#     print(await ChatHistory.get_user_msg_count(event.user_id, "private"))
-#     print(await ChatHistory.get_user_msg(event.user_id, "group"))
-#     print(await ChatHistory.get_user_msg_count(event.user_id, "group"))
-#     print(await ChatHistory.get_group_msg(event.group_id))
-#     print(await ChatHistory.get_group_msg_count(event.group_id))
+        logger.warning("存储聊天记录失败", "chat_history", e=e)

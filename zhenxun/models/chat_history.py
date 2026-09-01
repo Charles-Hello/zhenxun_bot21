@@ -1,15 +1,15 @@
 from datetime import datetime, timedelta
-from typing import Literal, Tuple
-
-from tortoise import fields
-from tortoise.functions import Count
+from typing import Any, ClassVar, Literal
 from typing_extensions import Self
 
+from tortoise import fields
+from tortoise.expressions import Q
+
 from zhenxun.services.db_context import Model
+from zhenxun.services.db_context.schema_ops import AlterColumnType, RenameColumn
 
 
 class ChatHistory(Model):
-
     id = fields.IntField(pk=True, generated=True, auto_increment=True)
     """自增id"""
     user_id = fields.CharField(255)
@@ -27,9 +27,49 @@ class ChatHistory(Model):
     platform = fields.CharField(255, null=True)
     """平台"""
 
-    class Meta:
+    class Meta:  # pyright: ignore [reportIncompatibleVariableOverride]
         table = "chat_history"
         table_description = "聊天记录数据表"
+        indexes: ClassVar = [
+            ("user_id", "create_time"),
+            ("group_id", "create_time"),
+            ("user_id", "group_id"),
+        ]
+
+    @classmethod
+    def _platform_from_scope(cls, platform_scope: str | None) -> str | None:
+        """Map the new fine-grained scope back to the legacy platform column."""
+        if not platform_scope:
+            return None
+        scope = str(platform_scope).lower()
+        if scope in {"qq", "qq_client", "qq_api"} or scope.startswith("qq_"):
+            return "qq"
+        if "onebot" in scope:
+            return "qq"
+        return scope
+
+    @classmethod
+    def scoped_query(cls, platform_scope: str | None = None, **filters: Any):
+        """Return a chat-history query compatible with platform_scope callers.
+
+        chat_history currently stores the coarse legacy ``platform`` column rather
+        than a dedicated ``platform_scope`` column, so this method intentionally
+        stays as a thin compatibility shim.
+        """
+        query = cls.filter(**filters)
+        if not platform_scope:
+            return query
+        if "platform" in filters or any(k.startswith("platform__") for k in filters):
+            return query
+
+        platform = cls._platform_from_scope(platform_scope)
+        if not platform:
+            return query
+        if platform == "qq" and str(platform_scope).lower() in {"qq", "qq_client"}:
+            return query.filter(
+                Q(platform=platform) | Q(platform__isnull=True) | Q(platform="")
+            )
+        return query.filter(platform=platform)
 
     @classmethod
     async def get_group_msg_rank(
@@ -38,7 +78,7 @@ class ChatHistory(Model):
         limit: int = 10,
         order: str = "DESC",
         date_scope: tuple[datetime, datetime] | None = None,
-    ) -> list[Self]:
+    ) -> list[tuple[str, int]]:
         """获取排行数据
 
         参数:
@@ -47,17 +87,9 @@ class ChatHistory(Model):
             order: 排序类型，desc，des
             date_scope: 日期范围
         """
-        o = "-" if order == "DESC" else ""
-        query = cls.filter(group_id=gid) if gid else cls
-        if date_scope:
-            query = query.filter(create_time__range=date_scope)
-        return list(
-            await query.annotate(count=Count("user_id"))
-            .order_by(o + "count")
-            .group_by("user_id")
-            .limit(limit)
-            .values_list("user_id", "count")
-        )  # type: ignore
+        from zhenxun.services.hot_query_cache import get_chat_history_rank_cached
+
+        return await get_chat_history_rank_cached(cls, gid, limit, order, date_scope)
 
     @classmethod
     async def get_group_first_msg_datetime(
@@ -68,24 +100,21 @@ class ChatHistory(Model):
         参数:
             group_id: 群组id
         """
-        if group_id:
-            message = (
-                await cls.filter(group_id=group_id).order_by("create_time").first()
-            )
-        else:
-            message = await cls.all().order_by("create_time").first()
-        if message:
-            return message.create_time
-        return None
+        from zhenxun.services.hot_query_cache import (
+            get_chat_history_first_msg_datetime_cached,
+        )
+
+        return await get_chat_history_first_msg_datetime_cached(cls, group_id)
 
     @classmethod
     async def get_message(
         cls,
-        uid: str,
-        gid: str,
+        uid: str | None,
+        gid: str | None,
         type_: Literal["user", "group"],
         msg_type: Literal["private", "group"] | None = None,
-        days: int | Tuple[datetime, datetime] | None = None,
+        days: int | tuple[datetime, datetime] | None = None,
+        platform_scope: str | None = None,
     ) -> list[Self]:
         """获取消息查询query
 
@@ -95,15 +124,16 @@ class ChatHistory(Model):
             type_: 类型，私聊或群聊
             msg_type: 消息类型，用户或群聊
             days: 限制日期
+            platform_scope: 兼容细粒度平台作用域
         """
         if type_ == "user":
-            query = cls.filter(user_id=uid)
+            query = cls.scoped_query(platform_scope=platform_scope, user_id=uid)
             if msg_type == "private":
                 query = query.filter(group_id__isnull=True)
             elif msg_type == "group":
                 query = query.filter(group_id__not_isnull=True)
         else:
-            query = cls.filter(group_id=gid)
+            query = cls.scoped_query(platform_scope=platform_scope, group_id=gid)
             if uid:
                 query = query.filter(user_id=uid)
         if days:
@@ -118,13 +148,22 @@ class ChatHistory(Model):
     @classmethod
     async def _run_script(cls):
         return [
-            "alter table chat_history alter group_id drop not null;",  # 允许 group_id 为空
-            "alter table chat_history alter text drop not null;",  # 允许 text 为空
-            "alter table chat_history alter plain_text drop not null;",  # 允许 plain_text 为空
-            "ALTER TABLE chat_history RENAME COLUMN user_qq TO user_id;",  # 将user_id改为user_id
-            "ALTER TABLE chat_history ALTER COLUMN user_id TYPE character varying(255);",
-            "ALTER TABLE chat_history ALTER COLUMN group_id TYPE character varying(255);",
-            "ALTER TABLE chat_history ADD bot_id VARCHAR(255);",  # 添加bot_id字段
-            "ALTER TABLE chat_history ALTER COLUMN bot_id TYPE character varying(255);",
-            "ALTER TABLE chat_history ADD COLUMN platform character varying(255);",
+            # 允许 group_id 为空
+            "alter table chat_history alter group_id drop not null;",
+            # 允许 text 为空
+            "alter table chat_history alter text drop not null;",
+            # 允许 plain_text 为空
+            "alter table chat_history alter plain_text drop not null;",
+            # 将user_id改为user_id
+            RenameColumn("chat_history", "user_qq", "user_id"),
+            AlterColumnType(
+                "chat_history",
+                "user_id",
+                {"postgres": "character varying(255)", "mysql": "VARCHAR(255)"},
+            ),
+            AlterColumnType(
+                "chat_history",
+                "group_id",
+                {"postgres": "character varying(255)", "mysql": "VARCHAR(255)"},
+            ),
         ]

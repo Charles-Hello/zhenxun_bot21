@@ -1,9 +1,18 @@
+import asyncio
+from typing_extensions import Self
+
 from nonebot.adapters import Bot
 from tortoise import fields
 
+from zhenxun.configs.config import BotConfig
+from zhenxun.models.group_console import GroupConsole
 from zhenxun.services.db_context import Model
+from zhenxun.services.log import logger
 from zhenxun.utils.enum import RequestHandleType, RequestType
 from zhenxun.utils.exception import NotFoundError
+from zhenxun.utils.manager.bot_profile_manager import BotProfileManager
+from zhenxun.utils.message import MessageUtils
+from zhenxun.utils.platform import PlatformUtils
 
 
 class FgRequest(Model):
@@ -31,13 +40,15 @@ class FgRequest(Model):
         RequestHandleType, null=True, description="处理类型"
     )
     """处理类型"""
+    message_ids = fields.CharField(max_length=255, null=True, description="消息id列表")
+    """消息id列表"""
 
-    class Meta:
+    class Meta:  # pyright: ignore [reportIncompatibleVariableOverride]
         table = "fg_request"
         table_description = "好友群组请求"
 
     @classmethod
-    async def approve(cls, bot: Bot, id: int):
+    async def approve(cls, bot: Bot, id: int) -> Self:
         """同意请求
 
         参数:
@@ -47,10 +58,10 @@ class FgRequest(Model):
         异常:
             NotFoundError: 未发现请求
         """
-        await cls._handle_request(bot, id, RequestHandleType.APPROVE)
+        return await cls._handle_request(bot, id, RequestHandleType.APPROVE)
 
     @classmethod
-    async def refused(cls, bot: Bot, id: int):
+    async def refused(cls, bot: Bot, id: int) -> Self:
         """拒绝请求
 
         参数:
@@ -60,10 +71,10 @@ class FgRequest(Model):
         异常:
             NotFoundError: 未发现请求
         """
-        await cls._handle_request(bot, id, RequestHandleType.REFUSED)
+        return await cls._handle_request(bot, id, RequestHandleType.REFUSED)
 
     @classmethod
-    async def ignore(cls, id: int):
+    async def ignore(cls, id: int) -> Self:
         """忽略请求
 
         参数:
@@ -72,14 +83,13 @@ class FgRequest(Model):
         异常:
             NotFoundError: 未发现请求
         """
-        await cls._handle_request(None, id, RequestHandleType.IGNORE)
+        return await cls._handle_request(None, id, RequestHandleType.IGNORE)
 
     @classmethod
     async def expire(cls, id: int):
         """忽略请求
 
         参数:
-            bot: Bot
             id: 请求id
 
         异常:
@@ -93,7 +103,7 @@ class FgRequest(Model):
         bot: Bot | None,
         id: int,
         handle_type: RequestHandleType,
-    ):
+    ) -> Self:
         """处理请求
 
         参数:
@@ -117,9 +127,51 @@ class FgRequest(Model):
                 await bot.set_friend_add_request(
                     flag=req.flag, approve=handle_type == RequestHandleType.APPROVE
                 )
+                if (
+                    handle_type == RequestHandleType.APPROVE
+                    and BotProfileManager.is_auto_send_profile()
+                ):
+                    if file_path := await BotProfileManager.build_bot_profile_image(
+                        bot.self_id
+                    ):
+                        await asyncio.sleep(1)
+                        await PlatformUtils.send_message(
+                            bot,
+                            req.user_id,
+                            None,
+                            MessageUtils.build_message(
+                                [
+                                    f"你好，我是{BotConfig.self_nickname}， "
+                                    "初次见面，希望我们可以好好相处！",
+                                    file_path,
+                                ]
+                            ),
+                        )
+                        logger.info(
+                            "添加好友自动发送BOT自我介绍图片", session=req.user_id
+                        )
             else:
-                await bot.set_group_add_request(
-                    flag=req.flag,
-                    sub_type="invite",
-                    approve=handle_type == RequestHandleType.APPROVE,
+                await GroupConsole.get_or_create_root_group(
+                    group_id=req.group_id,
+                    defaults={"group_flag": 1},
+                    update_defaults=True,
                 )
+                if req.flag == "0":
+                    # 用户手动申请入群，创建群认证后提醒用户拉群
+                    await bot.send_private_msg(
+                        user_id=req.user_id,
+                        message=f"已同意你对{BotConfig.self_nickname}的申请群组："
+                        f"{req.group_id}，可以直接手动拉入群组，{BotConfig.self_nickname}会自动同意。",
+                    )
+                else:
+                    # 正常同意群组请求
+                    await bot.set_group_add_request(
+                        flag=req.flag,
+                        sub_type="invite",
+                        approve=handle_type == RequestHandleType.APPROVE,
+                    )
+        return req
+
+    @classmethod
+    async def _run_script(cls):
+        return []

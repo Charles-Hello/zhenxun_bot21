@@ -1,203 +1,196 @@
-import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
+import re
 
+import nonebot
 from nonebot.adapters import Bot
-
-# from nonebot.adapters.discord import Bot as DiscordBot
-# from nonebot.adapters.dodo import Bot as DodoBot
-from nonebot.adapters.dodo.models import MemberInfo
-
-# from nonebot.adapters.kaiheila import Bot as KaiheilaBot
-from nonebot.adapters.onebot.v11 import Bot as v11Bot
-from nonebot.adapters.onebot.v12 import Bot as v12Bot
+from nonebot_plugin_uninfo import Member, Scene, SceneType, get_interface
 
 from zhenxun.configs.config import Config
+from zhenxun.models.group_console import GroupConsole
 from zhenxun.models.group_member_info import GroupInfoUser
 from zhenxun.models.level_user import LevelUser
+from zhenxun.services.hot_query_cache import (
+    invalidate_group_members,
+    invalidate_member_names,
+)
 from zhenxun.services.log import logger
+from zhenxun.utils.platform import PlatformUtils
 
 
 class MemberUpdateManage:
-
     @classmethod
-    async def update(cls, bot: Bot, group_id: str):
-        if isinstance(bot, v11Bot):
-            await cls.v11(bot, group_id)
-        elif isinstance(bot, v12Bot):
-            await cls.v12(bot, group_id)
-        # elif isinstance(bot, KaiheilaBot):
-        #     await cls.kaiheila(bot, group_id)
-        # elif isinstance(bot, DodoBot):
-        #     await cls.dodo(bot, group_id)
-        # elif isinstance(bot, DiscordBot):
-        #     await cls.discord(bot, group_id)
+    async def __handle_user(
+        cls,
+        member: Member,
+        db_user_map: dict[str, list[GroupInfoUser]],
+        group_id: str,
+        data_list: tuple[list[GroupInfoUser], list[GroupInfoUser], list[int]],
+        platform: str | None,
+        *,
+        default_auth: int | None,
+        superusers: set[str],
+    ):
+        """单个成员操作
 
-    # @classmethod
-    # async def discord(cls, bot: DiscordBot, group_id: str):
-    #     # TODO: discord更新群组成员信息
-    #     pass
-
-    # @classmethod
-    # async def dodo(cls, bot: DodoBot, group_id: str):
-    #     page_size = 100
-    #     result_size = 100
-    #     max_id = 0
-    #     exist_member_list = []
-    #     group_member_list: list[MemberInfo] = []
-    #     while result_size == page_size:
-    #         group_member_data = await bot.get_member_list(
-    #             island_source_id=group_id, page_size=page_size
-    #         )
-    #         result_size = len(group_member_data.list)
-    #         group_member_list += group_member_data.list
-    #         max_id = group_member_data.max_id
-    #     if group_member_list:
-    #         for user in group_member_list:
-    #             exist_member_list.append(user.dodo_source_id)
-    #             await GroupInfoUser.update_or_create(
-    #                 user_id=user.dodo_source_id,
-    #                 group_id=group_id,
-    #                 defaults={
-    #                     "user_name": user.nick_name or user.personal_nick_name,
-    #                     "user_join_time": user.join_time,
-    #                     "platform": "dodo",
-    #                 },
-    #             )
-    #     if delete_member_list := list(
-    #         set(exist_member_list).difference(
-    #             set(await GroupInfoUser.get_group_member_id_list(group_id))
-    #         )
-    #     ):
-    #         await GroupInfoUser.filter(
-    #             user_id__in=delete_member_list, group_id=group_id
-    #         ).delete()
-    #         logger.info(
-    #             f"删除已退群用户",
-    #             "更新群组成员信息",
-    #             group_id=group_id,
-    #             platform="dodo",
-    #         )
-
-    # @classmethod
-    # async def kaiheila(cls, bot: KaiheilaBot, group_id: str):
-    #     # TODO: kaiheila 更新群组成员信息
-    #     pass
-
-    @classmethod
-    async def v11(cls, bot: v11Bot, group_id: str):
-        exist_member_list = []
-        default_auth = Config.get_config("admin_bot_manage", "ADMIN_DEFAULT_AUTH")
-        group_member_list = await bot.get_group_member_list(group_id=int(group_id))
-        db_user = await GroupInfoUser.filter(group_id=group_id).all()
-        db_user_uid = [u.user_id for u in db_user]
-        uid2name = {u.user_id: u.user_name for u in db_user}
-        create_list = []
-        update_list = []
-        delete_list = []
-        for user_info in group_member_list:
-            user_id = str(user_info["user_id"])
-            nickname = user_info["card"] or user_info["nickname"]
-            role = user_info["role"]
-            if default_auth:
-                if role in ["owner", "admin"] and not await LevelUser.is_group_flag(
-                    user_id, group_id
-                ):
-                    await LevelUser.set_level(user_id, group_id, default_auth)
-            if user_id in bot.config.superusers:
-                await LevelUser.set_level(user_id, group_id, 9)
-            join_time = datetime.strptime(
-                time.strftime(
-                    "%Y-%m-%d %H:%M:%S", time.localtime(user_info["join_time"])
-                ),
-                "%Y-%m-%d %H:%M:%S",
-            ).replace(tzinfo=timezone(timedelta(hours=8)))
-            if cnt := db_user_uid.count(user_id):
-                users = [u for u in db_user if u.user_id == user_id]
+        参数:
+            member: Member
+            db_user: db成员数据
+            group_id: 群组id
+            data_list: 数据列表
+            platform: 平台
+        """
+        nickname = re.sub(
+            r"[\x00-\x09\x0b-\x1f\x7f-\x9f]", "", member.nick or member.user.name or ""
+        )
+        role = member.role
+        member_id = str(member.id)
+        if member_id in superusers:
+            await LevelUser.set_level(member_id, group_id, 9)
+        elif role and default_auth:
+            if role.id != "MEMBER" and not await LevelUser.is_group_flag(
+                member_id, group_id
+            ):
+                if role.id == "OWNER":
+                    await LevelUser.set_level(member_id, group_id, default_auth + 1)
+                elif role.id == "ADMINISTRATOR":
+                    await LevelUser.set_level(member_id, group_id, default_auth)
+        if users := db_user_map.get(member_id):
+            if len(users) > 1:
+                data_list[2].extend(u.id for u in users[1:])
+            if nickname != users[0].user_name:
                 user = users[0]
-                if cnt > 1:
-                    for u in users[1:]:
-                        delete_list.append(u.id)
-                if nickname != uid2name.get(user_id):
-                    user.user_name = nickname
-                    update_list.append(user)
-            else:
-                create_list.append(
-                    GroupInfoUser(
-                        user_id=user_id,
-                        group_id=group_id,
-                        user_name=nickname,
-                        user_join_time=join_time,
-                        platform="qq",
-                    )
+                user.user_name = nickname
+                data_list[1].append(user)
+        else:
+            data_list[0].append(
+                GroupInfoUser(
+                    user_id=member_id,
+                    group_id=group_id,
+                    user_name=nickname,
+                    user_join_time=member.joined_at or datetime.now(),
+                    platform=platform,
                 )
-            exist_member_list.append(user_id)
-        if create_list:
-            await GroupInfoUser.bulk_create(create_list, 30)
-            logger.debug(
-                f"创建用户数据 {len(create_list)} 条",
-                "更新群组成员信息",
-                target=group_id,
-            )
-        if update_list:
-            await GroupInfoUser.bulk_update(update_list, ["user_name"], 30)
-            logger.debug(
-                f"更新户数据 {len(update_list)} 条", "更新群组成员信息", target=group_id
-            )
-        if delete_list:
-            await GroupInfoUser.filter(id__in=delete_list).delete()
-            logger.debug(f"删除重复数据 Ids: {delete_list}", "更新群组成员信息")
-        if delete_member_list := list(
-            set(exist_member_list).difference(set(db_user_uid))
-        ):
-            await GroupInfoUser.filter(
-                user_id__in=delete_member_list, group_id=group_id
-            ).delete()
-            logger.info(
-                f"删除已退群用户", "更新群组成员信息", group_id=group_id, platform="qq"
             )
 
     @classmethod
-    async def v12(cls, bot: v12Bot, group_id: str):
-        # TODO: v12更新群组成员信息
-        pass
-        # exist_member_list = []
-        # default_auth = Config.get_config("admin_bot_manage", "ADMIN_DEFAULT_AUTH")
-        # group_member_list: list[GetGroupMemberInfoResp] = await bot.get_group_member_list(
-        #     group_id=group_id
-        # )
-        # for user_info in group_member_list:
-        #     user_id = user_info.user_id
-        #     nickname = user_info.user_displayname or user_info.user_name
-        #     role = user_info["role"]
-        #     if default_auth:
-        #         if role in ["owner", "admin"] and not LevelUser.is_group_flag(
-        #             str(user_id), group_id
-        #         ):
-        #             await LevelUser.set_level(user_id, group_id, default_auth)
-        #     if str(user_id) in bot.config.superusers:
-        #         await LevelUser.set_level(str(user_id), group_id, 9)
-        #     join_time = datetime.strptime(
-        #         time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(user_info["join_time"])),
-        #         "%Y-%m-%d %H:%M:%S",
-        #     )
-        #     await GroupInfoUser.update_or_create(
-        #         user_id=str(user_id),
-        #         group_id=group_id,
-        #         defaults={
-        #             "user_name": nickname,
-        #             "user_join_time": join_time.replace(
-        #                 tzinfo=timezone(timedelta(hours=8))
-        #             ),
-        #         },
-        #     )
-        #     exist_member_list.append(str(user_id))
-        #     logger.debug("更新成功", "更新群组成员信息", session=user_id, group_id=group_id)
-        # if delete_member_list := list(
-        #     set(exist_member_list).difference(
-        #         set(await GroupInfoUser.get_group_member_id_list(group_id))
-        #     )
-        # ):
-        #     await GroupInfoUser.filter(
-        #         user_id__in=delete_member_list, group_id=group_id
-        #     ).delete()
-        #     logger.info(f"删除已退群用户", "更新群组成员信息", group_id=group_id)
+    async def update_group_member(
+        cls,
+        bot: Bot,
+        group_id: str,
+        *,
+        scene_map: dict[str, Scene] | None = None,
+        platform: str | None = None,
+    ) -> str:
+        """更新群组成员信息
+
+        参数:
+            bot: Bot
+            group_id: 群组id
+
+        返回:
+            str: 返回消息
+        """
+        if not group_id:
+            logger.warning(f"bot: {bot.self_id}，group_id为空，无法更新群成员信息...")
+            return "群组id为空..."
+        if interface := get_interface(bot):
+            if scene_map is None:
+                scenes = await interface.get_scenes(SceneType.GROUP)
+                scene_map = {scene.id: scene for scene in scenes if scene.is_group}
+            if platform is None:
+                platform = PlatformUtils.get_platform(bot)
+            group_scene = scene_map.get(group_id) if scene_map else None
+            if not group_scene:
+                logger.warning(
+                    f"bot: {bot.self_id}，group_id: {group_id}，群组不存在，"
+                    "无法更新群成员信息..."
+                )
+                return "更新群组失败，群组不存在..."
+            members = await interface.get_members(SceneType.GROUP, group_scene.id)
+
+            try:
+                group_console, _ = await GroupConsole.get_or_create_root_group(
+                    group_id=group_id, defaults={"platform": platform}
+                )
+                group_console.member_count = len(members)
+                group_console.group_name = group_scene.name or ""
+                await group_console.save(update_fields=["member_count", "group_name"])
+                logger.debug(
+                    f"已更新群组 {group_id} 的成员总数为 {len(members)}",
+                    "更新群组成员信息",
+                )
+            except Exception as e:
+                logger.error(
+                    f"更新群组 {group_id} 的 GroupConsole 信息失败",
+                    "更新群组成员信息",
+                    e=e,
+                )
+
+            db_user = await GroupInfoUser.filter(group_id=group_id).all()
+            db_user_map: dict[str, list[GroupInfoUser]] = {}
+            for user in db_user:
+                db_user_map.setdefault(user.user_id, []).append(user)
+            db_user_ids = set(db_user_map)
+            data_list: tuple[list[GroupInfoUser], list[GroupInfoUser], list[int]] = (
+                [],
+                [],
+                [],
+            )
+            exist_member_ids: set[str] = set()
+            driver = nonebot.get_driver()
+            superusers = set(driver.config.superusers)
+            default_auth = Config.get_config("admin_bot_manage", "ADMIN_DEFAULT_AUTH")
+            for member in members:
+                member_id = str(member.id)
+                await cls.__handle_user(
+                    member,
+                    db_user_map,
+                    group_id,
+                    data_list,
+                    platform,
+                    default_auth=default_auth,
+                    superusers=superusers,
+                )
+                exist_member_ids.add(member_id)
+            if data_list[0]:
+                try:
+                    await GroupInfoUser.bulk_create(
+                        data_list[0], 30, ignore_conflicts=True
+                    )
+                    logger.debug(
+                        f"创建用户数据 {len(data_list[0])} 条",
+                        "更新群组成员信息",
+                        target=group_id,
+                    )
+                except Exception as e:
+                    logger.error("批量创建用户数据失败", "更新群组成员信息", e=e)
+            if data_list[1]:
+                await GroupInfoUser.bulk_update(data_list[1], ["user_name"], 30)
+                logger.debug(
+                    f"更新户数据 {len(data_list[1])} 条",
+                    "更新群组成员信息",
+                    target=group_id,
+                )
+            if data_list[2]:
+                await GroupInfoUser.filter(id__in=data_list[2]).delete()
+                logger.debug(f"删除重复数据 Ids: {data_list[2]}", "更新群组成员信息")
+
+            if delete_member_ids := db_user_ids - exist_member_ids:
+                await GroupInfoUser.filter(
+                    user_id__in=list(delete_member_ids), group_id=group_id
+                ).delete()
+                logger.info(
+                    f"删除已退群用户 {len(delete_member_ids)} 条",
+                    "更新群组成员信息",
+                    group_id=group_id,
+                    platform="qq",
+                )
+            changed_user_ids = (
+                {user.user_id for user in data_list[0]}
+                | {user.user_id for user in data_list[1]}
+                | delete_member_ids
+            )
+            if data_list[0] or data_list[1] or data_list[2] or delete_member_ids:
+                await invalidate_group_members(group_id, changed_user_ids)
+                await invalidate_member_names(changed_user_ids)
+        return "群组成员信息更新完成!"

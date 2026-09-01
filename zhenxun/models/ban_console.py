@@ -1,15 +1,18 @@
 import time
-
-from tortoise import fields
+from typing import ClassVar
 from typing_extensions import Self
 
+from tortoise import fields
+from tortoise.expressions import Q
+
+from zhenxun.services.cache.runtime_cache import BanMemoryCache
 from zhenxun.services.db_context import Model
 from zhenxun.services.log import logger
+from zhenxun.utils.enum import DbLockType
 from zhenxun.utils.exception import UserAndGroupIsNone
 
 
 class BanConsole(Model):
-
     id = fields.IntField(pk=True, generated=True, auto_increment=True)
     """自增id"""
     user_id = fields.CharField(255, null=True)
@@ -20,14 +23,33 @@ class BanConsole(Model):
     """使用ban命令的用户等级"""
     ban_time = fields.BigIntField()
     """ban开始的时间"""
+    ban_reason = fields.TextField(null=True, default=None)
+    """ban的理由"""
     duration = fields.BigIntField()
     """ban时长"""
     operator = fields.CharField(255)
     """使用Ban命令的用户"""
 
-    class Meta:
+    class Meta:  # pyright: ignore [reportIncompatibleVariableOverride]
         table = "ban_console"
-        table_description = ".ban/b了 封禁人员/群组数据表"
+        table_description = "封禁人员/群组数据表"
+        unique_together = ("user_id", "group_id")
+        indexes = [("user_id",), ("group_id",)]  # noqa: RUF012
+
+    enable_lock: ClassVar[list[DbLockType]] = [DbLockType.CREATE, DbLockType.UPSERT]
+    """开启锁"""
+
+    @classmethod
+    async def create(cls, *args, **kwargs) -> Self:
+        result = await super().create(*args, **kwargs)
+        await BanMemoryCache.upsert_from_model(result)
+        return result
+
+    async def delete(self, *args, **kwargs):
+        user_id = self.user_id
+        group_id = self.group_id
+        await super().delete(*args, **kwargs)
+        await BanMemoryCache.remove(user_id, group_id)
 
     @classmethod
     async def _get_data(cls, user_id: str | None, group_id: str | None) -> Self | None:
@@ -45,16 +67,17 @@ class BanConsole(Model):
         """
         if not user_id and not group_id:
             raise UserAndGroupIsNone()
-        user = None
         if user_id:
-            if group_id:
-                user = await cls.get_or_none(user_id=user_id, group_id=group_id)
-            else:
-                user = await cls.get_or_none(user_id=user_id, group_id__isnull=True)
+            return (
+                await cls.safe_get_or_none(user_id=user_id, group_id=group_id)
+                if group_id
+                else await cls.safe_get_or_none(user_id=user_id, group_id__isnull=True)
+            )
         else:
-            if group_id:
-                user = await cls.get_or_none(user_id__isnull=True, group_id=group_id)
-        return user
+            return await cls.safe_get_or_none(
+                Q(user_id__isnull=True) | Q(user_id=""),
+                group_id=group_id,
+            )
 
     @classmethod
     async def check_ban_level(
@@ -70,14 +93,10 @@ class BanConsole(Model):
         返回:
             bool: 权限判断，能否unban
         """
-        user = await cls._get_data(user_id, group_id)
-        if user:
-            logger.debug(
-                f"检测用户被ban等级，user_level: {user.ban_level}，level: {level}",
-                target=f"{group_id}:{user_id}",
-            )
-            return user.ban_level <= level
-        return False
+        logger.debug("检测用户被ban等级", target=f"{group_id}:{user_id}")
+        if not BanMemoryCache.is_loaded():
+            return False
+        return BanMemoryCache.check_ban_level(user_id, group_id, level)
 
     @classmethod
     async def check_ban_time(
@@ -91,18 +110,10 @@ class BanConsole(Model):
         返回:
             int: ban剩余时长，-1时为永久ban，0表示未被ban
         """
-        logger.debug(f"获取用户ban时长", target=f"{group_id}:{user_id}")
-        user = await cls._get_data(user_id, group_id)
-        if not user and user_id:
-            user = await cls._get_data(user_id, None)
-        if user:
-            if user.duration == -1:
-                return -1
-            _time = time.time() - (user.ban_time + user.duration)
-            if _time > 0:
-                return 0
-            return int(time.time() - user.ban_time - user.duration)
-        return 0
+        logger.debug("获取用户ban时长", target=f"{group_id}:{user_id}")
+        if not BanMemoryCache.is_loaded():
+            return 0
+        return BanMemoryCache.remaining_time(user_id, group_id)
 
     @classmethod
     async def is_ban(cls, user_id: str | None, group_id: str | None = None) -> bool:
@@ -114,12 +125,8 @@ class BanConsole(Model):
         返回:
             bool: 是否被ban
         """
-        logger.debug(f"检测是否被ban", target=f"{group_id}:{user_id}")
-        if await cls.check_ban_time(user_id, group_id):
-            return True
-        else:
-            await cls.unban(user_id, group_id)
-        return False
+        logger.debug("检测是否被ban", target=f"{group_id}:{user_id}")
+        return (await cls.check_ban_time(user_id, group_id)) != 0
 
     @classmethod
     async def ban(
@@ -127,6 +134,7 @@ class BanConsole(Model):
         user_id: str | None,
         group_id: str | None,
         ban_level: int,
+        reason: str | None,
         duration: int,
         operator: str | None = None,
     ):
@@ -143,17 +151,20 @@ class BanConsole(Model):
             f"封禁用户/群组，等级:{ban_level}，时长: {duration}",
             target=f"{group_id}:{user_id}",
         )
-        user = await cls._get_data(user_id, group_id)
-        if user:
-            await cls.unban(user_id, group_id)
-        await cls.create(
+        if not user_id and not group_id:
+            raise UserAndGroupIsNone()
+        target, _ = await cls.update_or_create(
             user_id=user_id,
             group_id=group_id,
-            ban_level=ban_level,
-            ban_time=int(time.time()),
-            duration=duration,
-            operator=operator or 0,
+            defaults={
+                "ban_level": ban_level,
+                "ban_time": int(time.time()),
+                "ban_reason": reason,
+                "duration": duration,
+                "operator": operator or 0,
+            },
         )
+        await BanMemoryCache.upsert_from_model(target)
 
     @classmethod
     async def unban(cls, user_id: str | None, group_id: str | None = None) -> bool:
@@ -172,3 +183,29 @@ class BanConsole(Model):
             await user.delete()
             return True
         return False
+
+    @classmethod
+    async def get_ban(
+        cls,
+        *,
+        id: int | None = None,
+        user_id: str | None = None,
+        group_id: str | None = None,
+    ) -> Self | None:
+        """安全地获取ban记录
+
+        参数:
+            id: 记录id
+            user_id: 用户id
+            group_id: 群组id
+
+        返回:
+            Self | None: ban记录
+        """
+        if id is not None:
+            return await cls.safe_get_or_none(id=id)
+        return await cls._get_data(user_id, group_id)
+
+    @classmethod
+    async def _run_script(cls):
+        return []

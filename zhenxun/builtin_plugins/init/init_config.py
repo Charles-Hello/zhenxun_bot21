@@ -1,3 +1,5 @@
+import hashlib
+import json
 from pathlib import Path
 
 import nonebot
@@ -11,6 +13,7 @@ from zhenxun.configs.config import Config
 from zhenxun.configs.path_config import DATA_PATH
 from zhenxun.configs.utils import RegisterConfig
 from zhenxun.services.log import logger
+from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 
 _yaml = YAML(pure=True)
 _yaml.allow_unicode = True
@@ -19,13 +22,14 @@ _yaml.indent = 2
 driver: Driver = nonebot.get_driver()
 
 SIMPLE_CONFIG_FILE = DATA_PATH / "config.yaml"
+_CONFIG_HASH_FILE = DATA_PATH / "configs" / ".config_hash"
 
 old_config_file = Path() / "zhenxun" / "configs" / "config.yaml"
 if old_config_file.exists():
     old_config_file.rename(SIMPLE_CONFIG_FILE)
 
 
-def _handle_config(plugin: Plugin):
+def _handle_config(plugin: Plugin, exists_module: list[str]):
     """处理配置项
 
     参数:
@@ -45,22 +49,24 @@ def _handle_config(plugin: Plugin):
                     reg_config.value,
                     help=reg_config.help,
                     default_value=reg_config.default_value,
-                    type=reg_config.type,
+                    type=reg_config.type,  # type: ignore
                     arg_parser=reg_config.arg_parser,
                     _override=False,
                 )
+                exists_module.append(f"{module}:{reg_config.key}".lower())
 
 
-def _generate_simple_config():
+def _generate_simple_config(exists_module: list[str]):
     """
     生成简易配置
 
     异常:
-        AttributeError: _description_
+        AttributeError: AttributeError
     """
     # 读取用户配置
     _data = {}
     _tmp_data = {}
+    exists_module += Config.add_module
     if SIMPLE_CONFIG_FILE.exists():
         _data = _yaml.load(SIMPLE_CONFIG_FILE.open(encoding="utf8"))
     # 将简易配置文件的数据填充到配置文件
@@ -70,17 +76,21 @@ def _generate_simple_config():
             try:
                 if _data.get(module) and k in _data[module].keys():
                     Config.set_config(module, k, _data[module][k])
-                _tmp_data[module][k] = Config.get_config(module, k)
+                if f"{module}:{k}".lower() in exists_module:
+                    _tmp_data[module][k] = Config.get_config(
+                        module, k, build_model=False
+                    )
             except AttributeError as e:
-                raise AttributeError(f"{e}\n" + "可能为config.yaml配置文件填写不规范")
+                raise AttributeError(f"{e}\n可能为config.yaml配置文件填写不规范") from e
+        if not _tmp_data[module]:
+            _tmp_data.pop(module)
     Config.save()
     temp_file = DATA_PATH / "temp_config.yaml"
-    # 重新生成简易配置文件
+    # 重新生成简易配置文件以挂载注释
     try:
         with open(temp_file, "w", encoding="utf8") as wf:
-            # yaml.dump(_tmp_data, wf, Dumper=yaml.RoundTripDumper, allow_unicode=True)
             _yaml.dump(_tmp_data, wf)
-        with open(temp_file, "r", encoding="utf8") as rf:
+        with open(temp_file, encoding="utf8") as rf:
             _data = _yaml.load(rf)
         # 添加注释
         for module in _data.keys():
@@ -93,30 +103,52 @@ def _generate_simple_config():
         with SIMPLE_CONFIG_FILE.open("w", encoding="utf8") as wf:
             _yaml.dump(_data, wf)
     except Exception as e:
-        logger.error(f"生成简易配置注释错误...", e=e)
+        logger.error("生成简易配置注释错误...", e=e)
     if temp_file.exists():
         temp_file.unlink()
 
 
-@driver.on_startup
+@PriorityLifecycle.on_startup(priority=0)
 def _():
     """
     初始化插件数据配置
     """
     plugins2config_file = DATA_PATH / "configs" / "plugins2config.yaml"
+    exists_module = []
     for plugin in get_loaded_plugins():
         if plugin.metadata:
-            _handle_config(plugin)
-    if not Config.is_empty():
-        Config.save()
-        _data: CommentedMap = _yaml.load(plugins2config_file.open(encoding="utf8"))
-        for module in _data.keys():
-            plugin_name = Config.get(module).name
-            _data.yaml_set_comment_before_after_key(
-                after=f"{plugin_name}",
-                key=module,
-            )
-        # 存完插件基本设置
-        with plugins2config_file.open("w", encoding="utf8") as wf:
-            _yaml.dump(_data, wf)
-    _generate_simple_config()
+            _handle_config(plugin, exists_module)
+    if Config.is_empty():
+        _generate_simple_config(exists_module)
+        Config.reload()
+        return
+    # 计算当前插件配置指纹，未变化则跳过重写
+    fingerprint = hashlib.md5(
+        json.dumps(sorted(exists_module), ensure_ascii=False).encode()
+    ).hexdigest()
+    if (
+        _CONFIG_HASH_FILE.exists()
+        and _CONFIG_HASH_FILE.read_text(encoding="utf-8").strip() == fingerprint
+        and plugins2config_file.exists()
+        and SIMPLE_CONFIG_FILE.exists()
+    ):
+        logger.debug("插件配置无变化，跳过配置文件重写", "初始化配置")
+        _generate_simple_config(exists_module)
+        Config.reload()
+        return
+    Config.save()
+    _data: CommentedMap = _yaml.load(plugins2config_file.open(encoding="utf8"))
+    for module in _data.keys():
+        plugin_name = Config.get(module).name
+        _data.yaml_set_comment_before_after_key(
+            after=f"{plugin_name}",
+            key=module,
+        )
+    # 存完插件基本设置
+    with plugins2config_file.open("w", encoding="utf8") as wf:
+        _yaml.dump(_data, wf)
+    _generate_simple_config(exists_module)
+    Config.reload()
+    # 保存指纹
+    _CONFIG_HASH_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _CONFIG_HASH_FILE.write_text(fingerprint, encoding="utf-8")

@@ -1,53 +1,149 @@
+from datetime import datetime
+from pathlib import Path
 import uuid
 
-from nonebot import require
+import nonebot
+from nonebot.adapters import Bot
 from nonebot.drivers import Driver
+from packaging.specifiers import SpecifierSet
+from packaging.version import Version
 from tortoise import Tortoise
-from tortoise.exceptions import OperationalError
+from tortoise.exceptions import IntegrityError, OperationalError
+import ujson as json
 
+from zhenxun.models.bot_connect_log import BotConnectLog
+from zhenxun.models.bot_console import BotConsole
 from zhenxun.models.goods_info import GoodsInfo
 from zhenxun.models.group_member_info import GroupInfoUser
 from zhenxun.models.sign_user import SignUser
 from zhenxun.models.user_console import UserConsole
 from zhenxun.services.log import logger
 from zhenxun.utils.decorator.shop import shop_register
-
-require("nonebot_plugin_apscheduler")
-require("nonebot_plugin_alconna")
-require("nonebot_plugin_session")
-require("nonebot_plugin_userinfo")
-require("nonebot_plugin_htmlrender")
-
-
-import nonebot
-import ujson as json
+from zhenxun.utils.manager.priority_manager import PriorityLifecycle
+from zhenxun.utils.manager.zhenxun_repo_manager import ZhenxunRepoManager
+from zhenxun.utils.platform import PlatformUtils
 
 driver: Driver = nonebot.get_driver()
 
 
+@driver.on_bot_connect
+async def _(bot: Bot):
+    logger.debug(f"Bot: {bot.self_id} 建立连接...")
+    await BotConnectLog.create(
+        bot_id=bot.self_id, platform=bot.adapter, connect_time=datetime.now(), type=1
+    )
+    if not await BotConsole.exists(bot_id=bot.self_id):
+        try:
+            await BotConsole.create(
+                bot_id=bot.self_id, platform=PlatformUtils.get_platform(bot)
+            )
+        except IntegrityError as e:
+            logger.warning(f"记录bot: {bot.self_id} 数据已存在...", e=e)
+
+
+@driver.on_bot_disconnect
+async def _(bot: Bot):
+    logger.debug(f"Bot: {bot.self_id} 断开连接...")
+    try:
+        await BotConnectLog.create(
+            bot_id=bot.self_id,
+            platform=bot.adapter,
+            connect_time=datetime.now(),
+            type=0,
+        )
+    except Exception as e:
+        logger.warning(f"记录bot: {bot.self_id} 断开连接失败", e=e)
+
+
 SIGN_SQL = """
-select distinct on("user_id") t1.user_id, t1.checkin_count, t1.add_probability, t1.specify_probability, t1.impression
-from public.sign_group_users t1
-  join ( 
-    select user_id, max(t2.impression) as max_impression
-    from public.sign_group_users t2
-    group by user_id
-  ) t on t.user_id = t1.user_id and t.max_impression = t1.impression
+SELECT user_id, checkin_count, add_probability, specify_probability, impression
+FROM (
+    SELECT
+        t1.user_id,
+        t1.checkin_count,
+        t1.add_probability,
+        t1.specify_probability,
+        t1.impression,
+        ROW_NUMBER() OVER(PARTITION BY t1.user_id ORDER BY t1.impression DESC) AS rn
+    FROM sign_group_users t1
+    INNER JOIN (
+        SELECT user_id, MAX(impression) AS max_impression
+        FROM sign_group_users
+        GROUP BY user_id
+    ) t2 ON t2.user_id = t1.user_id AND t2.max_impression = t1.impression
+) t
+WHERE rn = 1
 """
 
 BAG_SQL = """
 select t1.user_id, t1.gold, t1.property
-from public.bag_users t1
-  join ( 
+from bag_users t1
+  join (
     select user_id, max(t2.gold) as max_gold
-    from public.bag_users t2
+    from bag_users t2
     group by user_id
   ) t on t.user_id = t1.user_id and t.max_gold = t1.gold
 """
 
 
-@driver.on_startup
+@PriorityLifecycle.on_startup(priority=5)
 async def _():
+    try:
+        should_update = False
+        resource_path = ZhenxunRepoManager.config.RESOURCE_PATH
+        default_theme_path = resource_path / "themes" / "default"
+        version_file = resource_path / "__version__"
+
+        if (
+            not ZhenxunRepoManager.check_resources_exists()
+            or not default_theme_path.exists()
+            or not version_file.exists()
+        ):
+            should_update = True
+            logger.info(
+                "检测到资源文件(字体/主题/版本信息)缺失，准备进行初始化下载...",
+                "资源检查",
+            )
+        else:
+            spec_file = Path("resources.spec")
+            req_ver_str = ">=0.0.0"
+            if spec_file.exists():
+                try:
+                    for line in spec_file.read_text("utf-8").splitlines():
+                        if line.strip().startswith("require_resources_version:"):
+                            req_ver_str = line.split(":", 1)[1].strip().strip("'\"")
+                            break
+                except Exception:
+                    pass
+
+            local_ver_str = "0.0.0"
+            try:
+                content = version_file.read_text("utf-8").strip()
+                local_ver_str = (
+                    content.split(":", 1)[1].strip() if ":" in content else content
+                )
+            except Exception:
+                pass
+
+            if not SpecifierSet(req_ver_str).contains(Version(local_ver_str)):
+                should_update = True
+                logger.info(
+                    f"资源版本({local_ver_str})不满足要求({req_ver_str})，准备强制更新...",
+                    "资源检查",
+                )
+
+        if should_update:
+            logger.info("开始下载资源文件，请耐心等待...", "资源检查")
+            result = await ZhenxunRepoManager.resources_update()
+            if result and not result.success:
+                logger.error(
+                    f"资源下载失败: {result.error_message}",
+                    "资源检查",
+                )
+            else:
+                logger.info("资源文件下载/更新完成", "资源检查")
+    except Exception as e:
+        logger.error(f"资源检查或更新失败: {e}", "资源检查")
     """签到与用户的数据迁移"""
     if goods_list := await GoodsInfo.filter(uuid__isnull=True).all():
         for goods in goods_list:
@@ -62,27 +158,39 @@ async def _():
             group_user = []
             try:
                 group_user = await GroupInfoUser.filter(uid__isnull=False).all()
-            except Exception:
-                logger.warning("获取GroupInfoUser数据uid失败...")
+            except Exception as e:
+                logger.warning("获取GroupInfoUser数据uid失败...", e=e)
             user2uid = {u.user_id: u.uid for u in group_user}
             db = Tortoise.get_connection("default")
-            old_sign_list = await db.execute_query_dict(SIGN_SQL)
-            old_bag_list = await db.execute_query_dict(BAG_SQL)
+            try:
+                old_sign_list = await db.execute_query_dict(SIGN_SQL)
+            except OperationalError as e:
+                if "no such table" in str(e).lower() or "sign_group_users" in str(e):
+                    # 旧签到表不存在，说明是全新环境或已完成过迁移，正常跳过
+                    logger.debug("旧签到表 sign_group_users 不存在，跳过数据迁移")
+                    old_sign_list = []
+                else:
+                    raise
+            try:
+                old_bag_list = await db.execute_query_dict(BAG_SQL)
+            except OperationalError as e:
+                if "no such table" in str(e).lower() or "bag_users" in str(e):
+                    logger.debug("旧背包表 bag_users 不存在，跳过数据迁移")
+                    old_bag_list = []
+                else:
+                    raise
             goods = {
                 g["goods_name"]: g["uuid"]
                 for g in await GoodsInfo.annotate().values("goods_name", "uuid")
             }
             create_list = []
             sign_id_list = []
-            max_uid = 0
-            if user2uid:
-                max_uid = max(user2uid.values()) + 1
+            max_uid = max(user2uid.values()) + 1 if user2uid else 0
             for old_sign in old_sign_list:
                 sign_id_list.append(old_sign["user_id"])
-                old_bag = [
+                if old_bag := [
                     b for b in old_bag_list if b["user_id"] == old_sign["user_id"]
-                ]
-                if old_bag:
+                ]:
                     old_bag = old_bag[0]
                     property = json.loads(old_bag["property"])
                     props = {}
@@ -115,9 +223,9 @@ async def _():
             create_list.clear()
             uc_dict = {u.user_id: u for u in await UserConsole.all()}
             for old_sign in old_sign_list:
-                user_console = uc_dict.get(old_sign["user_id"])
-                if not user_console:
-                    user_console = await UserConsole.get_user(old_sign["user_id"], "qq")
+                user_console = uc_dict.get(
+                    old_sign["user_id"]
+                ) or await UserConsole.get_user(old_sign["user_id"], "qq")
                 create_list.append(
                     SignUser(
                         user_id=old_sign["user_id"],

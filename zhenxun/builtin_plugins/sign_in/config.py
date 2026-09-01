@@ -1,12 +1,6 @@
 from zhenxun.configs.path_config import IMAGE_PATH
 
-SIGN_RESOURCE_PATH = IMAGE_PATH / "sign" / "sign_res"
 SIGN_TODAY_CARD_PATH = IMAGE_PATH / "sign" / "today_card"
-SIGN_BORDER_PATH = SIGN_RESOURCE_PATH / "border"
-SIGN_BACKGROUND_PATH = SIGN_RESOURCE_PATH / "background"
-
-SIGN_BORDER_PATH.mkdir(exist_ok=True, parents=True)
-SIGN_BACKGROUND_PATH.mkdir(exist_ok=True, parents=True)
 
 
 lik2relation = {
@@ -36,7 +30,6 @@ level2attitude = {
 weekdays = {1: "Mon", 2: "Tue", 3: "Wed", 4: "Thu", 5: "Fri", 6: "Sat", 7: "Sun"}
 
 lik2level = {
-    9999: "9",
     400: "8",
     270: "7",
     200: "6",
